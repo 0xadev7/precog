@@ -167,45 +167,82 @@ def binance_klines(symbol: str, interval: str, start_ms: int, end_ms: int, limit
 
 def fetch_reddit_posts(subreddits: List[str], limit: int = 100) -> List[str]:
     """Fetch recent Reddit posts (titles + selftext) for crypto subs."""
+    if not ENABLE_SOCIAL_SENTIMENT or not ENABLE_REDDIT_SENTIMENT:
+        return []
+
     headers = {"User-Agent": USER_AGENT}
     texts: List[str] = []
     subs_joined = "+".join(subreddits)
     url = f"{REDDIT_BASE}/r/{subs_joined}/new.json"
     try:
-        r = requests.get(url, params={"limit": min(limit, 100)}, headers=headers, timeout=10)
+        r = requests.get(
+            url,
+            params={"limit": min(limit, 100)},
+            headers=headers,
+            timeout=10,
+        )
+        if r.status_code == 403:
+            global _REDDIT_403_WARNED
+            if not _REDDIT_403_WARNED:
+                bt.logging.warning(
+                    "Reddit sentiment disabled: HTTP 403 Forbidden. "
+                    "Set ENABLE_REDDIT_SENTIMENT=0 or configure an authenticated Reddit client."
+                )
+                _REDDIT_403_WARNED = True
+            return texts
         if r.status_code != 200:
             bt.logging.warning(f"Reddit HTTP {r.status_code}: {r.text[:120]}")
             return texts
+
         data = r.json()
         for child in data.get("data", {}).get("children", []):
             post = child.get("data", {})
             title = post.get("title", "") or ""
             body = post.get("selftext", "") or ""
-            txt = (title + " " + body).strip()
+            txt = f"{title}\n{body}".strip()
             if txt:
                 texts.append(txt)
+        return texts
     except Exception as e:
-        bt.logging.warning(f"Reddit fetch error: {e}")
-    return texts
+        bt.logging.warning(f"Reddit fetch failed: {e}")
+        return texts
 
 
 def fetch_stocktwits_messages(symbol: str = "BTC.X", limit: int = 30) -> List[str]:
     """Fetch recent messages from Stocktwits public REST (no key)."""
+    if not ENABLE_SOCIAL_SENTIMENT or not ENABLE_STOCKTWITS_SENTIMENT:
+        return []
+
     url = f"{STOCKTWITS_BASE}/streams/symbol/{symbol}.json"
     try:
-        r = requests.get(url, params={"limit": min(limit, 30)}, headers={"User-Agent": USER_AGENT}, timeout=10)
+        r = requests.get(
+            url,
+            params={"limit": min(limit, 30)},
+            headers={"User-Agent": USER_AGENT},
+            timeout=10,
+        )
+        if r.status_code == 403:
+            global _STOCKTWITS_403_WARNED
+            if not _STOCKTWITS_403_WARNED:
+                bt.logging.warning(
+                    "Stocktwits sentiment disabled: HTTP 403 Forbidden. "
+                    "Set ENABLE_STOCKTWITS_SENTIMENT=0 or configure an authenticated client."
+                )
+                _STOCKTWITS_403_WARNED = True
+            return []
         if r.status_code != 200:
             bt.logging.warning(f"Stocktwits HTTP {r.status_code}: {r.text[:120]}")
             return []
+
         data = r.json()
-        out = []
+        out: List[str] = []
         for msg in data.get("messages", []):
             body = msg.get("body", "")
             if isinstance(body, str) and body:
                 out.append(body)
         return out
     except Exception as e:
-        bt.logging.warning(f"Stocktwits fetch error: {e}")
+        bt.logging.warning(f"Stocktwits fetch failed: {e}")
         return []
 
 
@@ -274,27 +311,35 @@ def _lexicon_sentiment(texts: List[str]) -> float:
 
 
 def compute_social_sentiment() -> Dict[str, float]:
-    """Return {"score": [-1,1], "n_posts": int} combining Reddit + Stocktwits."""
+    """Return {'score': [-1,1], 'n_posts': int} combining Reddit + Stocktwits."""
+    if not ENABLE_SOCIAL_SENTIMENT:
+        bt.logging.debug("Social sentiment disabled via ENABLE_SOCIAL_SENTIMENT=0")
+        return {"score": 0.0, "n_posts": 0}
+
     subreddits = ["Bitcoin", "CryptoCurrency", "CryptoMarkets"]
+
     reddit_texts = fetch_reddit_posts(subreddits, limit=100)
     st_texts = fetch_stocktwits_messages("BTC.X", limit=30)
     texts = reddit_texts + st_texts
 
+    if not texts:
+        # No usable data from providers -> neutral sentiment
+        return {"score": 0.0, "n_posts": 0}
+
     if VADER_OK:
         try:
             analyzer = SentimentIntensityAnalyzer()
-            if not texts:
-                score = 0.0
-            else:
-                comp = [analyzer.polarity_scores(t).get("compound", 0.0) for t in texts]
-                score = float(np.median(comp))
+            comp = [analyzer.polarity_scores(t).get("compound", 0.0) for t in texts]
+            score = float(np.median(comp)) if comp else 0.0
         except Exception as e:
-            bt.logging.warning(f"VADER error, falling back to lexicon: {e}")
+            bt.logging.warning(f"VADER sentiment failed, falling back to lexicon: {e}")
             score = _lexicon_sentiment(texts)
     else:
         score = _lexicon_sentiment(texts)
 
-    return {"score": float(np.clip(score, -1, 1)), "n_posts": int(len(texts))}
+    # Clamp to [-1, 1]
+    score = float(max(min(score, 1.0), -1.0))
+    return {"score": score, "n_posts": int(len(texts))}
 
 
 # -----------------------------
