@@ -67,13 +67,50 @@ def _ema(series: pd.Series, span: int) -> pd.Series:
 
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    up = np.where(delta > 0, delta, 0.0)
-    down = np.where(delta < 0, -delta, 0.0)
-    roll_up = pd.Series(up, index=series.index).ewm(alpha=1 / period, adjust=False).mean()
-    roll_down = pd.Series(down, index=series.index).ewm(alpha=1 / period, adjust=False).mean()
+    """
+    Robust RSI that:
+    - Forces the input to float64 (no pandas NA scalars)
+    - Logs basic diagnostics
+    - Avoids 'boolean value of NA is ambiguous'
+    """
+    # Coerce to numeric float64; any bad values -> NaN (not pd.NA)
+    s = pd.to_numeric(series, errors="coerce").astype("float64")
+
+    # Basic diagnostics
+    try:
+        bt.logging.debug(f"RSI: len={len(s)}, dtype={s.dtype}, " f"na_in_series={int(s.isna().sum())}")
+    except Exception:
+        # Logging should never crash RSI
+        pass
+
+    # First difference, again enforce float64 and handle NaNs
+    delta = s.diff().astype("float64")
+    na_delta = int(delta.isna().sum())
+    try:
+        bt.logging.debug(f"RSI: after diff -> na_in_delta={na_delta}")
+    except Exception:
+        pass
+
+    # Replace initial NaN from diff (and any others) with 0.0
+    delta = delta.fillna(0.0)
+
+    # IMPORTANT: at this point delta is plain float64, so > 0 yields a clean bool array
+    up = np.where(delta > 0.0, delta, 0.0)
+    down = np.where(delta < 0.0, -delta, 0.0)
+
+    roll_up = pd.Series(up, index=s.index).ewm(alpha=1 / period, adjust=False).mean()
+    roll_down = pd.Series(down, index=s.index).ewm(alpha=1 / period, adjust=False).mean()
+
     rs = roll_up / (roll_down + 1e-12)
-    return 100 - (100 / (1 + rs))
+    rsi_vals = 100.0 - (100.0 / (1.0 + rs))
+
+    # Final debug
+    try:
+        bt.logging.debug(f"RSI: output len={len(rsi_vals)}, " f"na_in_rsi={int(rsi_vals.isna().sum())}")
+    except Exception:
+        pass
+
+    return rsi_vals
 
 
 def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
@@ -388,6 +425,11 @@ def build_minute_features(price_df: pd.DataFrame, deriv_df: Optional[pd.DataFram
     out["ema_ratio"] = (out["ema_7"] / (out["ema_21"] + 1e-9)) - 1.0
 
     # RSI, MACD
+    bt.logging.debug(
+        f"build_minute_features: computing RSI on close "
+        f"(len={len(out['close'])}, dtype={out['close'].dtype}, "
+        f"na={int(out['close'].isna().sum())})"
+    )
     out["rsi_14"] = rsi(out["close"], 14).bfill().fillna(50.0)
     macd_line, macd_signal, macd_hist = macd(out["close"])
     out["macd"] = macd_line
