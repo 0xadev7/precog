@@ -46,9 +46,9 @@ STOCKTWITS_BASE = "https://api.stocktwits.com/api/2"
 
 USER_AGENT = os.environ.get("MINER_UA", "Eric-BTC-Miner/2.0 (+https://github.com)")
 
-# Forecast horizon in minutes for the supervised target
+# Forecast horizon in minutes for the supervised target (next-1h by default)
 HORIZON_MIN = int(os.environ.get("HORIZON_MIN", "60"))
-# How many days of 1-min training data
+# How many days of 1-min history we pull each forward()
 LOOKBACK_DAYS = float(os.environ.get("LOOKBACK_DAYS", "2"))
 # Cap for sentiment drift as a multiple of hourly vol
 SENTIMENT_IMPACT_CAP = float(os.environ.get("SENTIMENT_IMPACT_CAP", "0.25"))
@@ -58,9 +58,14 @@ USE_DERIVATIVES = os.environ.get("USE_DERIVATIVES", "1") == "1"
 MAX_OI_MARKETS = int(os.environ.get("MAX_OI_MARKETS", "5"))  # markets per asset
 DERIV_LOOKBACK_DAYS = float(os.environ.get("DERIV_LOOKBACK_DAYS", "3"))
 
+# Social sentiment flags
 ENABLE_SOCIAL_SENTIMENT = os.environ.get("ENABLE_SOCIAL_SENTIMENT", "1") == "1"
 ENABLE_REDDIT_SENTIMENT = os.environ.get("ENABLE_REDDIT_SENTIMENT", "1") == "1"
 ENABLE_STOCKTWITS_SENTIMENT = os.environ.get("ENABLE_STOCKTWITS_SENTIMENT", "1") == "1"
+
+# Log 403s only once
+_REDDIT_403_WARNED = False
+_STOCKTWITS_403_WARNED = False
 
 
 # -----------------------------
@@ -442,7 +447,7 @@ def get_derivatives_timeseries(
         return None
 
     deriv = pd.concat(frames, axis=1).sort_index()
-    # Drop duplicates indices (if any) by keeping last
+    # Drop duplicate indices (if any) by keeping last
     deriv = deriv[~deriv.index.duplicated(keep="last")]
     return deriv
 
@@ -452,26 +457,73 @@ def get_derivatives_timeseries(
 # -----------------------------
 def build_minute_features(price_df: pd.DataFrame, deriv_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """
-    price_df: 1-min OHLC with datetime index and at least 'close'.
+    price_df: 1-min OHLC[V] with datetime index and at least 'close'.
     deriv_df: optional derivatives features with datetime index (will be resampled -> 1T).
+
+    Features target next-HORIZON_MIN log-return, so we focus on:
+    - Multi-horizon returns
+    - Realized volatility
+    - OHLC structure
+    - Volume regime (when available)
+    - Time-of-day / day-of-week
+    - Derivatives (OI, funding) if present
     """
     df = price_df.copy().sort_index()
+
+    # Ensure numeric OHLCV
+    for c in ["open", "high", "low", "close", "volume"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
     out = pd.DataFrame(index=df.index)
     out["close"] = df["close"]
 
-    # Returns
-    out["ret_1m"] = out["close"].pct_change().fillna(0.0)
-    out["ret_5m"] = out["close"].pct_change(5).fillna(0.0)
-    out["ret_15m"] = out["close"].pct_change(15).fillna(0.0)
+    # Basic OHLC structure
+    if {"open", "high", "low", "close"}.issubset(df.columns):
+        out["hl_range"] = (df["high"] - df["low"]) / (df["close"] + 1e-9)
+        out["candle_body"] = (df["close"] - df["open"]) / (df["close"] + 1e-9)
+    else:
+        out["hl_range"] = 0.0
+        out["candle_body"] = 0.0
 
-    # Vol
-    out["vol_30m"] = realized_vol(out["ret_1m"], window=30).bfill().fillna(0.0)
-    out["vol_60m"] = realized_vol(out["ret_1m"], window=60).bfill().fillna(0.0)
+    # Volume features (if available)
+    if "volume" in df.columns:
+        out["vol_1m"] = df["volume"].fillna(0.0)
+        out["vol_5m"] = out["vol_1m"].rolling(5, min_periods=1).sum()
+        out["vol_30m"] = out["vol_1m"].rolling(30, min_periods=1).sum()
+        out["vol_60m"] = out["vol_1m"].rolling(60, min_periods=1).sum()
 
-    # Trend / momentum
-    out["ema_7"] = _ema(out["close"], 7)
-    out["ema_21"] = _ema(out["close"], 21)
-    out["ema_ratio"] = (out["ema_7"] / (out["ema_21"] + 1e-9)) - 1.0
+        vol_mean_30 = out["vol_1m"].rolling(30, min_periods=5).mean()
+        vol_std_30 = out["vol_1m"].rolling(30, min_periods=5).std(ddof=0)
+        out["vol_z_30m"] = (out["vol_1m"] - vol_mean_30) / (vol_std_30 + 1e-9)
+    else:
+        out["vol_1m"] = 0.0
+        out["vol_5m"] = 0.0
+        out["vol_30m"] = 0.0
+        out["vol_60m"] = 0.0
+        out["vol_z_30m"] = 0.0
+
+    # Returns and realized volatility
+    close = out["close"].astype("float64")
+    ret_1m = np.log(close / close.shift(1))
+    out["ret_1m"] = ret_1m.fillna(0.0)
+
+    for w in [5, 15, 30, 60]:
+        out[f"ret_{w}m"] = ret_1m.rolling(w, min_periods=1).sum()
+
+    out["rv_15m"] = realized_vol(ret_1m, window=15)
+    out["rv_30m"] = realized_vol(ret_1m, window=30)
+    out["rv_60m"] = realized_vol(ret_1m, window=60)
+    out["rv_240m"] = realized_vol(ret_1m, window=240)
+
+    # Trend / momentum (EMAs)
+    out["ema_10"] = _ema(close, 10)
+    out["ema_50"] = _ema(close, 50)
+    out["ema_200"] = _ema(close, 200)
+
+    out["ema_10_dist"] = (close - out["ema_10"]) / (close + 1e-9)
+    out["ema_50_dist"] = (close - out["ema_50"]) / (close + 1e-9)
+    out["ema_200_dist"] = (close - out["ema_200"]) / (close + 1e-9)
 
     # RSI, MACD
     bt.logging.debug(
@@ -488,6 +540,21 @@ def build_minute_features(price_df: pd.DataFrame, deriv_df: Optional[pd.DataFram
     # Bollinger band z-score
     lower, ma, upper = bbands(out["close"], 20, 2.0)
     out["bb_z"] = (out["close"] - ma) / (upper - lower + 1e-9)
+
+    # Time-of-day / day-of-week features
+    idx = out.index
+    if isinstance(idx, pd.DatetimeIndex):
+        minute_of_day = idx.hour * 60 + idx.minute
+        dow = idx.dayofweek
+        out["mod_sin"] = np.sin(2 * np.pi * minute_of_day / (24 * 60))
+        out["mod_cos"] = np.cos(2 * np.pi * minute_of_day / (24 * 60))
+        out["dow_sin"] = np.sin(2 * np.pi * dow / 7)
+        out["dow_cos"] = np.cos(2 * np.pi * dow / 7)
+    else:
+        out["mod_sin"] = 0.0
+        out["mod_cos"] = 0.0
+        out["dow_sin"] = 0.0
+        out["dow_cos"] = 0.0
 
     # Derivatives features (optional)
     if deriv_df is not None and not deriv_df.empty:
@@ -509,13 +576,15 @@ def build_minute_features(price_df: pd.DataFrame, deriv_df: Optional[pd.DataFram
 
     # Clean
     out = out.replace([np.inf, -np.inf], np.nan)
-    out = out.bfill().fillna(method="ffill").dropna()
+    out = out.ffill().bfill()
+    out = out.dropna()
     return out
 
 
 def make_supervised(features: pd.DataFrame, horizon_min: int) -> Tuple[pd.DataFrame, pd.Series]:
     """
     Build supervised dataset where target is log-return over the next horizon.
+    Target y_t = log(close_{t+h} / close_t).
     """
     close = features["close"].copy()
     target = np.log(close.shift(-horizon_min) / (close + 1e-9))
@@ -609,9 +678,17 @@ def get_price_history(asset: str, start: pd.Timestamp, end: pd.Timestamp, cm: Op
                 df["time"] = pd.to_datetime(df["time"], utc=True)
                 df = df.set_index("time").sort_index()
                 ohlc = df["close"].resample("1min").ohlc()
-                ohlc = ohlc.rename(columns={"open": "open", "high": "high", "low": "low", "close": "close"})
+                ohlc = ohlc.rename(
+                    columns={
+                        "open": "open",
+                        "high": "high",
+                        "low": "low",
+                        "close": "close",
+                    }
+                )
                 ohlc = ohlc.dropna()
                 if not ohlc.empty:
+                    # No volume from CM; keep OHLC only
                     return ohlc
     except Exception as e:
         bt.logging.warning(f"CoinMetrics price fetch failed for {asset}, will try Binance: {e}")
@@ -645,10 +722,10 @@ def get_price_history(asset: str, start: pd.Timestamp, end: pd.Timestamp, cm: Op
             "ignore",
         ],
     )
-    for c in ["open", "high", "low", "close"]:
+    for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["time"] = pd.to_datetime(df["closeTime"], unit="ms", utc=True)
-    df = df.set_index("time")[["open", "high", "low", "close"]].sort_index()
+    df = df.set_index("time")[["open", "high", "low", "close", "volume"]].sort_index()
     return df
 
 
@@ -711,7 +788,13 @@ def _fit_predict_return(X: pd.DataFrame, y: pd.Series) -> float:
 
 def _apply_sentiment_adjustment(pred_return: float, vol_1h: float, sentiment: Dict[str, float]) -> float:
     s = float(np.clip(sentiment.get("score", 0.0), -1.0, 1.0))
-    impact = float(np.clip(s * vol_1h, -SENTIMENT_IMPACT_CAP * vol_1h, SENTIMENT_IMPACT_CAP * vol_1h))
+    impact = float(
+        np.clip(
+            s * vol_1h,
+            -SENTIMENT_IMPACT_CAP * vol_1h,
+            SENTIMENT_IMPACT_CAP * vol_1h,
+        )
+    )
     return pred_return + impact
 
 
@@ -725,7 +808,8 @@ async def forward_async(synapse: Challenge, cm: CMData) -> Challenge:
     assets = [a.lower() for a in raw_assets]
 
     bt.logging.info(
-        f"👈 Received prediction request from: {getattr(synapse.dendrite, 'hotkey', 'unknown')} "
+        f"👈 Received prediction request from: "
+        f"{getattr(synapse.dendrite, 'hotkey', 'unknown')} "
         f"for {assets} at timestamp: {synapse.timestamp}"
     )
 
@@ -739,7 +823,8 @@ async def forward_async(synapse: Challenge, cm: CMData) -> Challenge:
     # Compute BTC-focused sentiment once per forward
     sentiment = compute_social_sentiment()
     bt.logging.info(
-        f"Social sentiment: score={sentiment['score']:.3f} from {sentiment['n_posts']} posts "
+        f"Social sentiment: score={sentiment['score']:.3f} "
+        f"from {sentiment['n_posts']} posts "
         f"(VADER={'on' if VADER_OK else 'off'})"
     )
 
@@ -767,7 +852,7 @@ async def forward_async(synapse: Challenge, cm: CMData) -> Challenge:
             # 3) Features + supervised dataset
             bt.logging.debug(f"{asset}: building features")
             feats = build_minute_features(px, deriv_df=deriv_df)
-            bt.logging.debug(f"{asset}: features shape={feats.shape}, columns={list(feats.columns)}")
+            bt.logging.debug(f"{asset}: features shape={feats.shape}, " f"columns={list(feats.columns)}")
 
             X, y = make_supervised(feats, horizon_min=HORIZON_MIN)
             bt.logging.debug(f"{asset}: supervised X={X.shape}, y={y.shape}")
@@ -797,18 +882,23 @@ async def forward_async(synapse: Challenge, cm: CMData) -> Challenge:
             # 6) Convert to price prediction
             last_price = float(feats["close"].iloc[-1])
             point_estimate = float(last_price * math.exp(pred_ret_adj))
-            bt.logging.debug(f"{asset}: last_price={last_price}, point_estimate={point_estimate}")
+            bt.logging.debug(f"{asset}: last_price={last_price}, " f"point_estimate={point_estimate}")
 
             # 7) Interval
             interval = calculate_prediction_interval(point_estimate, feats["close"], asset)
             bt.logging.debug(f"{asset}: interval={interval}")
 
             predictions[asset] = point_estimate
-            intervals[asset] = [float(interval[0]), float(interval[1])]
+            intervals[asset] = [
+                float(interval[0]),
+                float(interval[1]),
+            ]
 
             bt.logging.info(
-                f"{asset.upper()} last=${last_price:,.2f} pred_ret={pred_ret_adj:.5f} -> "
-                f"pred=${point_estimate:,.2f} [{interval[0]:,.2f}, {interval[1]:,.2f}]"
+                f"{asset.upper()} last=${last_price:,.2f} "
+                f"pred_ret={pred_ret_adj:.5f} -> "
+                f"pred=${point_estimate:,.2f} "
+                f"[{interval[0]:,.2f}, {interval[1]:,.2f}]"
             )
         except Exception as e:
             # FULL traceback here:
