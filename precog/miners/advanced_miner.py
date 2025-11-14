@@ -58,6 +58,10 @@ USE_DERIVATIVES = os.environ.get("USE_DERIVATIVES", "1") == "1"
 MAX_OI_MARKETS = int(os.environ.get("MAX_OI_MARKETS", "5"))  # markets per asset
 DERIV_LOOKBACK_DAYS = float(os.environ.get("DERIV_LOOKBACK_DAYS", "3"))
 
+ENABLE_SOCIAL_SENTIMENT = os.environ.get("ENABLE_SOCIAL_SENTIMENT", "1") == "1"
+ENABLE_REDDIT_SENTIMENT = os.environ.get("ENABLE_REDDIT_SENTIMENT", "1") == "1"
+ENABLE_STOCKTWITS_SENTIMENT = os.environ.get("ENABLE_STOCKTWITS_SENTIMENT", "1") == "1"
+
 
 # -----------------------------
 # Technical indicator utilities
