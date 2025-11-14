@@ -9,6 +9,9 @@ import pandas as pd
 import requests
 import bittensor as bt
 
+import dotenv
+dotenv.load_dotenv()
+
 from precog.protocol import Challenge
 from precog.utils.cm_data import CMData
 from precog.utils.timestamp import to_datetime, to_str
@@ -798,6 +801,100 @@ def _apply_sentiment_adjustment(pred_return: float, vol_1h: float, sentiment: Di
     return pred_return + impact
 
 
+def _predict_for_asset(
+    asset: str,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    cm: CMData,
+    sentiment: Dict[str, float],
+) -> Tuple[str, Optional[float], Optional[Tuple[float, float]]]:
+    asset = asset.lower()
+    bt.logging.debug(f"{asset}: starting prediction pipeline")
+    try:
+        # 1) Price history
+        bt.logging.debug(f"{asset}: fetching price history from {start_ts} to {end_ts}")
+        px = get_price_history(asset, start_ts, end_ts, cm)
+        bt.logging.debug(f"{asset}: price history shape={px.shape}")
+
+        if px.empty or "close" not in px.columns:
+            raise RuntimeError("Price history empty")
+
+        # 2) Derivatives time series
+        deriv_df = None
+        if USE_DERIVATIVES and cm is not None and hasattr(cm, "client"):
+            bt.logging.debug(f"{asset}: fetching derivatives timeseries")
+            deriv_df = get_derivatives_timeseries(cm, asset, start_ts, end_ts)
+            if deriv_df is not None:
+                bt.logging.debug(f"{asset}: deriv_df shape={deriv_df.shape}")
+            else:
+                bt.logging.debug(f"{asset}: deriv_df is None")
+
+        # 3) Features + supervised dataset
+        bt.logging.debug(f"{asset}: building features")
+        feats = build_minute_features(px, deriv_df=deriv_df)
+        bt.logging.debug(f"{asset}: features shape={feats.shape}, columns={list(feats.columns)}")
+
+        X, y = make_supervised(feats, horizon_min=HORIZON_MIN)
+        bt.logging.debug(f"{asset}: supervised X={X.shape}, y={y.shape}")
+
+        # 4) Model -> next-horizon log-return
+        bt.logging.debug(f"{asset}: fitting model")
+        pred_ret = _fit_predict_return(X, y)
+        bt.logging.debug(f"{asset}: raw predicted return={pred_ret}")
+
+        # 5) Sentiment adjustment
+        vol_1h_raw = feats["ret_1m"].rolling(60).std().iloc[-1]
+        bt.logging.debug(f"{asset}: vol_1h_raw={vol_1h_raw}")
+        if pd.isna(vol_1h_raw) or not np.isfinite(vol_1h_raw):
+            vol_1h_raw = feats["ret_1m"].std()
+            bt.logging.debug(f"{asset}: vol_1h fallback using std={vol_1h_raw}")
+        vol_1h = float(vol_1h_raw) if np.isfinite(vol_1h_raw) and vol_1h_raw > 0 else 0.0
+        bt.logging.debug(f"{asset}: vol_1h={vol_1h}")
+
+        pred_ret_adj = _apply_sentiment_adjustment(pred_ret, vol_1h, sentiment)
+        bt.logging.debug(f"{asset}: sentiment-adjusted return={pred_ret_adj}")
+
+        # 6) Convert to price
+        last_price = float(feats["close"].iloc[-1])
+        point_estimate = float(last_price * math.exp(pred_ret_adj))
+        bt.logging.debug(f"{asset}: last_price={last_price}, point_estimate={point_estimate}")
+
+        # 7) Interval
+        interval = calculate_prediction_interval(point_estimate, feats["close"], asset)
+        bt.logging.debug(f"{asset}: interval={interval}")
+
+        bt.logging.info(
+            f"{asset.upper()} last=${last_price:,.2f} "
+            f"pred_ret={pred_ret_adj:.5f} -> "
+            f"pred=${point_estimate:,.2f} "
+            f"[{interval[0]:,.2f}, {interval[1]:,.2f}]"
+        )
+        return asset, point_estimate, interval
+
+    except Exception as e:
+        bt.logging.error(f"{asset}: prediction error -> {e}", exc_info=True)
+
+        # Fallback nowcast
+        last_price = 0.0
+        try:
+            if "feats" in locals() and "close" in feats.columns and not feats["close"].empty:
+                last_price = float(feats["close"].iloc[-1])
+            elif "px" in locals() and not px.empty:
+                last_price = float(px["close"].iloc[-1])
+        except Exception:
+            last_price = 0.0
+
+        if last_price <= 0:
+            return asset, None, None
+
+        lo, hi = calculate_prediction_interval(
+            last_price,
+            feats["close"] if "feats" in locals() and "close" in feats.columns else pd.Series(dtype=float),
+            asset,
+        )
+        return asset, last_price, (lo, hi)
+
+
 # ------------------------------------------------------------
 # Public API: async forward (signature unchanged)
 # ------------------------------------------------------------
@@ -828,103 +925,29 @@ async def forward_async(synapse: Challenge, cm: CMData) -> Challenge:
         f"(VADER={'on' if VADER_OK else 'off'})"
     )
 
-    for asset in assets:
-        bt.logging.debug(f"{asset}: starting prediction pipeline")
-        try:
-            # 1) Price history
-            bt.logging.debug(f"{asset}: fetching price history from {start_ts} to {end_ts}")
-            px = get_price_history(asset, start_ts, end_ts, cm)
-            bt.logging.debug(f"{asset}: price history shape={px.shape}")
+    loop = asyncio.get_running_loop()
+    tasks = [
+        asyncio.to_thread(
+            _predict_for_asset,
+            asset,
+            start_ts,
+            end_ts,
+            cm,
+            sentiment,
+        )
+        for asset in assets
+    ]
 
-            if px.empty or "close" not in px.columns:
-                raise RuntimeError("Price history empty")
+    results = await asyncio.gather(*tasks, return_exceptions=False)
 
-            # 2) Derivatives time series
-            deriv_df = None
-            if USE_DERIVATIVES and cm is not None and hasattr(cm, "client"):
-                bt.logging.debug(f"{asset}: fetching derivatives timeseries")
-                deriv_df = get_derivatives_timeseries(cm, asset, start_ts, end_ts)
-                if deriv_df is not None:
-                    bt.logging.debug(f"{asset}: deriv_df shape={deriv_df.shape}")
-                else:
-                    bt.logging.debug(f"{asset}: deriv_df is None")
+    predictions: Dict[str, float] = {}
+    intervals: Dict[str, List[float]] = {}
 
-            # 3) Features + supervised dataset
-            bt.logging.debug(f"{asset}: building features")
-            feats = build_minute_features(px, deriv_df=deriv_df)
-            bt.logging.debug(f"{asset}: features shape={feats.shape}, " f"columns={list(feats.columns)}")
-
-            X, y = make_supervised(feats, horizon_min=HORIZON_MIN)
-            bt.logging.debug(f"{asset}: supervised X={X.shape}, y={y.shape}")
-
-            # 4) Technical/derivatives model -> next-horizon log return
-            bt.logging.debug(f"{asset}: fitting model")
-            pred_ret = _fit_predict_return(X, y)
-            bt.logging.debug(f"{asset}: raw predicted return={pred_ret}")
-
-            # 5) Sentiment adjustment
-            vol_1h_raw = feats["ret_1m"].rolling(60).std().iloc[-1]
-            bt.logging.debug(f"{asset}: vol_1h_raw={vol_1h_raw}")
-
-            if pd.isna(vol_1h_raw) or not np.isfinite(vol_1h_raw):
-                vol_1h_raw = feats["ret_1m"].std()
-                bt.logging.debug(f"{asset}: vol_1h fallback using std={vol_1h_raw}")
-
-            if not np.isfinite(vol_1h_raw) or vol_1h_raw <= 0:
-                vol_1h = 0.0
-            else:
-                vol_1h = float(vol_1h_raw)
-
-            bt.logging.debug(f"{asset}: vol_1h={vol_1h}")
-            pred_ret_adj = _apply_sentiment_adjustment(pred_ret, vol_1h, sentiment)
-            bt.logging.debug(f"{asset}: sentiment-adjusted return={pred_ret_adj}")
-
-            # 6) Convert to price prediction
-            last_price = float(feats["close"].iloc[-1])
-            point_estimate = float(last_price * math.exp(pred_ret_adj))
-            bt.logging.debug(f"{asset}: last_price={last_price}, " f"point_estimate={point_estimate}")
-
-            # 7) Interval
-            interval = calculate_prediction_interval(point_estimate, feats["close"], asset)
-            bt.logging.debug(f"{asset}: interval={interval}")
-
-            predictions[asset] = point_estimate
-            intervals[asset] = [
-                float(interval[0]),
-                float(interval[1]),
-            ]
-
-            bt.logging.info(
-                f"{asset.upper()} last=${last_price:,.2f} "
-                f"pred_ret={pred_ret_adj:.5f} -> "
-                f"pred=${point_estimate:,.2f} "
-                f"[{interval[0]:,.2f}, {interval[1]:,.2f}]"
-            )
-        except Exception as e:
-            # FULL traceback here:
-            bt.logging.error(f"{asset}: prediction error -> {e}", exc_info=True)
-
-            # Fallback: nowcast with wide band if we have any price
-            try:
-                if "feats" in locals() and "close" in feats.columns:
-                    last_price = float(feats["close"].iloc[-1])
-                elif "px" in locals() and not px.empty:
-                    last_price = float(px["close"].iloc[-1])
-                else:
-                    last_price = 0.0
-            except Exception:
-                last_price = 0.0
-
-            if last_price <= 0:
-                continue
-
-            lo, hi = calculate_prediction_interval(
-                last_price,
-                feats["close"] if "feats" in locals() and "close" in feats.columns else pd.Series(dtype=float),
-                asset,
-            )
-            predictions[asset] = last_price
-            intervals[asset] = [float(lo), float(hi)]
+    for asset, point_estimate, interval in results:
+        if point_estimate is None or interval is None:
+            continue
+        predictions[asset] = float(point_estimate)
+        intervals[asset] = [float(interval[0]), float(interval[1])]
 
     synapse.predictions = predictions
     synapse.intervals = intervals
