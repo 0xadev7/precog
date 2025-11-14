@@ -444,7 +444,7 @@ def calculate_prediction_interval(
     Volatility-based 99% prediction interval scaled to the forecast horizon.
     """
     try:
-        if historical_prices.empty or len(historical_prices) < 60:
+        if historical_prices is None or len(historical_prices) < 60:
             margin = point_estimate * 0.10
             return point_estimate - margin, point_estimate + margin
 
@@ -453,15 +453,19 @@ def calculate_prediction_interval(
             margin = point_estimate * 0.10
             return point_estimate - margin, point_estimate + margin
 
-        vol_60m = rets.rolling(60).std().iloc[-1]
-        if pd.isna(vol_60m) or not np.isfinite(vol_60m):
-            vol_60m = rets.std()
+        vol_60m_raw = rets.rolling(60).std().iloc[-1]
+        bt.logging.debug(f"{asset}: interval vol_60m_raw={vol_60m_raw}")
 
-        if not np.isfinite(vol_60m) or vol_60m <= 0:
+        if pd.isna(vol_60m_raw) or not np.isfinite(vol_60m_raw):
+            fallback_vol = rets.std()
+            bt.logging.debug(f"{asset}: interval fallback_vol={fallback_vol}")
+            vol_60m = float(fallback_vol) if np.isfinite(fallback_vol) else 0.0
+        else:
+            vol_60m = float(vol_60m_raw)
+
+        if vol_60m <= 0:
             margin = point_estimate * 0.10
             return point_estimate - margin, point_estimate + margin
-
-        vol_60m = float(vol_60m)
 
         z = 2.58  # ~99%
         scaled_vol = vol_60m * math.sqrt(max(1, HORIZON_MIN) / 60.0)
@@ -473,10 +477,10 @@ def calculate_prediction_interval(
 
         lower = point_estimate - margin
         upper = point_estimate + margin
-        bt.logging.debug(f"{asset}: hourly_vol={vol_60m:.4f}, margin=${margin:.2f}")
+        bt.logging.debug(f"{asset}: interval vol_60m={vol_60m:.4f}, margin={margin:.2f}")
         return lower, upper
     except Exception as e:
-        bt.logging.error(f"Error calculating interval for {asset}: {e}")
+        bt.logging.error(f"Error calculating interval for {asset}: {e}", exc_info=True)
         margin = point_estimate * 0.15
         return point_estimate - margin, point_estimate + margin
 
@@ -649,40 +653,64 @@ async def forward_async(synapse: Challenge, cm: CMData) -> Challenge:
     )
 
     for asset in assets:
+        bt.logging.debug(f"{asset}: starting prediction pipeline")
         try:
             # 1) Price history
+            bt.logging.debug(f"{asset}: fetching price history from {start_ts} to {end_ts}")
             px = get_price_history(asset, start_ts, end_ts, cm)
+            bt.logging.debug(f"{asset}: price history shape={px.shape}")
+
             if px.empty or "close" not in px.columns:
                 raise RuntimeError("Price history empty")
 
-            # 2) Derivatives time series (Open Interest + Funding)
+            # 2) Derivatives time series
             deriv_df = None
             if USE_DERIVATIVES and cm is not None and hasattr(cm, "client"):
+                bt.logging.debug(f"{asset}: fetching derivatives timeseries")
                 deriv_df = get_derivatives_timeseries(cm, asset, start_ts, end_ts)
+                if deriv_df is not None:
+                    bt.logging.debug(f"{asset}: deriv_df shape={deriv_df.shape}")
+                else:
+                    bt.logging.debug(f"{asset}: deriv_df is None")
 
             # 3) Features + supervised dataset
+            bt.logging.debug(f"{asset}: building features")
             feats = build_minute_features(px, deriv_df=deriv_df)
+            bt.logging.debug(f"{asset}: features shape={feats.shape}, columns={list(feats.columns)}")
+
             X, y = make_supervised(feats, horizon_min=HORIZON_MIN)
+            bt.logging.debug(f"{asset}: supervised X={X.shape}, y={y.shape}")
 
             # 4) Technical/derivatives model -> next-horizon log return
+            bt.logging.debug(f"{asset}: fitting model")
             pred_ret = _fit_predict_return(X, y)
+            bt.logging.debug(f"{asset}: raw predicted return={pred_ret}")
 
             # 5) Sentiment adjustment
-            vol_1h = feats["ret_1m"].rolling(60).std().iloc[-1]
-            if pd.isna(vol_1h) or not np.isfinite(vol_1h):
-                vol_1h = feats["ret_1m"].std()
-            if not np.isfinite(vol_1h) or vol_1h <= 0:
-                vol_1h = 0.0
-            vol_1h = float(vol_1h)
+            vol_1h_raw = feats["ret_1m"].rolling(60).std().iloc[-1]
+            bt.logging.debug(f"{asset}: vol_1h_raw={vol_1h_raw}")
 
+            if pd.isna(vol_1h_raw) or not np.isfinite(vol_1h_raw):
+                vol_1h_raw = feats["ret_1m"].std()
+                bt.logging.debug(f"{asset}: vol_1h fallback using std={vol_1h_raw}")
+
+            if not np.isfinite(vol_1h_raw) or vol_1h_raw <= 0:
+                vol_1h = 0.0
+            else:
+                vol_1h = float(vol_1h_raw)
+
+            bt.logging.debug(f"{asset}: vol_1h={vol_1h}")
             pred_ret_adj = _apply_sentiment_adjustment(pred_ret, vol_1h, sentiment)
+            bt.logging.debug(f"{asset}: sentiment-adjusted return={pred_ret_adj}")
 
             # 6) Convert to price prediction
             last_price = float(feats["close"].iloc[-1])
             point_estimate = float(last_price * math.exp(pred_ret_adj))
+            bt.logging.debug(f"{asset}: last_price={last_price}, point_estimate={point_estimate}")
 
             # 7) Interval
             interval = calculate_prediction_interval(point_estimate, feats["close"], asset)
+            bt.logging.debug(f"{asset}: interval={interval}")
 
             predictions[asset] = point_estimate
             intervals[asset] = [float(interval[0]), float(interval[1])]
@@ -692,13 +720,15 @@ async def forward_async(synapse: Challenge, cm: CMData) -> Challenge:
                 f"pred=${point_estimate:,.2f} [{interval[0]:,.2f}, {interval[1]:,.2f}]"
             )
         except Exception as e:
-            bt.logging.error(f"{asset}: prediction error -> {e}")
+            # FULL traceback here:
+            bt.logging.error(f"{asset}: prediction error -> {e}", exc_info=True)
+
             # Fallback: nowcast with wide band if we have any price
             try:
-                if "close" in locals().get("feats", pd.DataFrame()).columns:
-                    last_price = float(feats["close"].iloc[-1])  # type: ignore
-                elif "px" in locals() and not px.empty:  # type: ignore
-                    last_price = float(px["close"].iloc[-1])  # type: ignore
+                if "feats" in locals() and "close" in feats.columns:
+                    last_price = float(feats["close"].iloc[-1])
+                elif "px" in locals() and not px.empty:
+                    last_price = float(px["close"].iloc[-1])
                 else:
                     last_price = 0.0
             except Exception:
