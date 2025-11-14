@@ -379,8 +379,8 @@ def build_minute_features(price_df: pd.DataFrame, deriv_df: Optional[pd.DataFram
     out["ret_15m"] = out["close"].pct_change(15).fillna(0.0)
 
     # Vol
-    out["vol_30m"] = realized_vol(out["ret_1m"], window=30).fillna(method="bfill").fillna(0.0)
-    out["vol_60m"] = realized_vol(out["ret_1m"], window=60).fillna(method="bfill").fillna(0.0)
+    out["vol_30m"] = realized_vol(out["ret_1m"], window=30).bfill().fillna(0.0)
+    out["vol_60m"] = realized_vol(out["ret_1m"], window=60).bfill().fillna(0.0)
 
     # Trend / momentum
     out["ema_7"] = _ema(out["close"], 7)
@@ -388,7 +388,7 @@ def build_minute_features(price_df: pd.DataFrame, deriv_df: Optional[pd.DataFram
     out["ema_ratio"] = (out["ema_7"] / (out["ema_21"] + 1e-9)) - 1.0
 
     # RSI, MACD
-    out["rsi_14"] = rsi(out["close"], 14).fillna(method="bfill").fillna(50.0)
+    out["rsi_14"] = rsi(out["close"], 14).bfill().fillna(50.0)
     macd_line, macd_signal, macd_hist = macd(out["close"])
     out["macd"] = macd_line
     out["macd_sig"] = macd_signal
@@ -418,7 +418,7 @@ def build_minute_features(price_df: pd.DataFrame, deriv_df: Optional[pd.DataFram
 
     # Clean
     out = out.replace([np.inf, -np.inf], np.nan)
-    out = out.fillna(method="bfill").fillna(method="ffill").dropna()
+    out = out.bfill().fillna(method="ffill").dropna()
     return out
 
 
@@ -453,7 +453,16 @@ def calculate_prediction_interval(
             margin = point_estimate * 0.10
             return point_estimate - margin, point_estimate + margin
 
-        vol_60m = float(rets.rolling(60).std().iloc[-1] or rets.std())
+        vol_60m = rets.rolling(60).std().iloc[-1]
+        if pd.isna(vol_60m) or not np.isfinite(vol_60m):
+            vol_60m = rets.std()
+
+        if not np.isfinite(vol_60m) or vol_60m <= 0:
+            margin = point_estimate * 0.10
+            return point_estimate - margin, point_estimate + margin
+
+        vol_60m = float(vol_60m)
+
         z = 2.58  # ~99%
         scaled_vol = vol_60m * math.sqrt(max(1, HORIZON_MIN) / 60.0)
         margin = point_estimate * z * scaled_vol
@@ -504,7 +513,7 @@ def get_price_history(asset: str, start: pd.Timestamp, end: pd.Timestamp, cm: Op
                 )
                 df["time"] = pd.to_datetime(df["time"], utc=True)
                 df = df.set_index("time").sort_index()
-                ohlc = df["close"].resample("1T").ohlc()
+                ohlc = df["close"].resample("1min").ohlc()
                 ohlc = ohlc.rename(columns={"open": "open", "high": "high", "low": "low", "close": "close"})
                 ohlc = ohlc.dropna()
                 if not ohlc.empty:
@@ -659,7 +668,13 @@ async def forward_async(synapse: Challenge, cm: CMData) -> Challenge:
             pred_ret = _fit_predict_return(X, y)
 
             # 5) Sentiment adjustment
-            vol_1h = float(feats["ret_1m"].rolling(60).std().iloc[-1] or 0.0)
+            vol_1h = feats["ret_1m"].rolling(60).std().iloc[-1]
+            if pd.isna(vol_1h) or not np.isfinite(vol_1h):
+                vol_1h = feats["ret_1m"].std()
+            if not np.isfinite(vol_1h) or vol_1h <= 0:
+                vol_1h = 0.0
+            vol_1h = float(vol_1h)
+
             pred_ret_adj = _apply_sentiment_adjustment(pred_ret, vol_1h, sentiment)
 
             # 6) Convert to price prediction
