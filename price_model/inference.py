@@ -1,7 +1,6 @@
 # price_model/inference.py
 
 import os
-import time
 from typing import Tuple, Dict
 
 import numpy as np
@@ -11,17 +10,13 @@ import joblib
 import tensorflow as tf
 
 from .config import (
-    BINANCE_BASE,
-    BINANCE_SYMBOLS,
+    GATE_BASE,
+    ASSETS,
     INTERVAL,
-    INTERVAL_SEC,
+    SEQ_LEN,
     PROCESSED_DIR,
     MODEL_DIR,
-    SEQ_LEN,
 )
-
-# Binance interval string (e.g. "5m")
-INTERVAL_STR = INTERVAL
 
 # Cache for models and scalers so we don't reload on every inference
 _model_cache: Dict[str, tf.keras.Model] = {}
@@ -31,8 +26,9 @@ _scaler_cache: Dict[str, object] = {}
 def _load_model_and_scaler(asset: str):
     """
     Load (or reuse cached) GRU model and scaler for the given asset symbol,
-    where asset is "BTC", "ETH", "TAO".
+    where asset is 'BTC', 'ETH', or 'TAO'.
     """
+    asset = asset.upper()
     if asset in _model_cache:
         return _model_cache[asset], _scaler_cache[asset]
 
@@ -51,6 +47,8 @@ def _load_model_and_scaler(asset: str):
         raise RuntimeError(f"Scaler not found for {asset}: {scaler_path}")
 
     scaler = joblib.load(scaler_path)
+
+    # Avoid deserializing training-time metrics (mse, etc.)
     model = tf.keras.models.load_model(model_path, compile=False)
 
     _model_cache[asset] = model
@@ -58,59 +56,65 @@ def _load_model_and_scaler(asset: str):
     return model, scaler
 
 
-def _binance_latest_window(asset: str, lookback_steps: int = SEQ_LEN) -> pd.DataFrame:
+def _gate_latest_window(asset: str, lookback_steps: int = SEQ_LEN) -> pd.DataFrame:
     """
-    Fetch the latest `lookback_steps` candles for the asset from Binance spot.
+    Fetch the latest `lookback_steps` candles for the asset from Gate.io spot.
 
-    We simply request a limited number of latest klines (no startTime), which
-    Binance returns in ascending order, most recent last.
+    We call /spot/candlesticks with a 'limit' parameter (no 'from' / 'to') to
+    avoid 'too long ago' and 'range too broad' errors. Gate returns rows like:
+
+      [t, v, c, h, l, o, ...]  (most recent first)
+
+    We convert to a DataFrame with columns:
+      timestamp (seconds), open, high, low, close, volume
     """
-    if asset not in BINANCE_SYMBOLS:
-        raise ValueError(f"Unknown asset for Binance: {asset}")
+    asset = asset.lower()
+    if asset.upper() not in ASSETS:
+        raise ValueError(f"Unknown asset for Gate.io: {asset}")
 
-    symbol = BINANCE_SYMBOLS[asset]
-    limit = max(lookback_steps + 10, 100)  # small safety margin
+    symbol = ASSETS[asset.upper()]["symbol"]
 
-    url = f"{BINANCE_BASE}/api/v3/klines"
+    # Ask for a bit more than SEQ_LEN as safety margin
+    limit = max(lookback_steps + 10, lookback_steps)
+
+    url = f"{GATE_BASE}/spot/candlesticks"
     params = {
-        "symbol": symbol,
-        "interval": INTERVAL_STR,
+        "currency_pair": symbol,
+        "interval": INTERVAL,
         "limit": limit,
     }
 
     r = requests.get(url, params=params, timeout=10)
     r.raise_for_status()
-    klines = r.json()
+    data = r.json()
 
-    if not klines:
-        raise RuntimeError(f"No kline data returned from Binance for {asset}")
+    if not data:
+        raise RuntimeError(f"No candlestick data from Gate.io for {asset} ({symbol})")
 
     rows = []
-    for k in klines:
-        open_time = int(k[0])
-        open_ = float(k[1])
-        high = float(k[2])
-        low = float(k[3])
-        close = float(k[4])
-        volume = float(k[5])
-        rows.append((open_time, open_, high, low, close, volume))
+    # Gate returns newest first; we'll sort ascending by timestamp
+    for row in data:
+        # row schema: [t, v, c, h, l, o, ...]
+        ts = int(row[0])
+        vol = float(row[1])
+        close = float(row[2])
+        high = float(row[3])
+        low = float(row[4])
+        open_ = float(row[5])
+        rows.append((ts, open_, high, low, close, vol))
 
-    df = pd.DataFrame(rows, columns=["timestamp_ms", "open", "high", "low", "close", "volume"])
-
-    # Deduplicate & keep chronological order
-    df = df.drop_duplicates("timestamp_ms").sort_values("timestamp_ms").reset_index(drop=True)
-
-    # Add seconds timestamp + datetime
-    df["timestamp"] = (df["timestamp_ms"] // 1000).astype("int64")
-    df["datetime"] = pd.to_datetime(df["timestamp_ms"], unit="ms", utc=True)
+    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df = df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
 
     if len(df) < lookback_steps:
         raise RuntimeError(
             f"Not enough recent candles for {asset}: " f"len(df)={len(df)} < lookback_steps={lookback_steps}"
         )
 
-    # Return just the last `lookback_steps` rows
-    return df.tail(lookback_steps).reset_index(drop=True)
+    # Only keep the last lookback_steps rows
+    df = df.tail(lookback_steps).reset_index(drop=True)
+    df["datetime"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+    return df
 
 
 def predict_1h_price(asset: str) -> Tuple[float, float]:
@@ -119,7 +123,7 @@ def predict_1h_price(asset: str) -> Tuple[float, float]:
     the trained GRU model.
 
     Args:
-        asset: "BTC", "ETH", or "TAO" (upper-case).
+        asset: 'BTC', 'ETH', or 'TAO' (case-insensitive).
 
     Returns:
         (current_price, predicted_price_1h)
@@ -127,8 +131,8 @@ def predict_1h_price(asset: str) -> Tuple[float, float]:
     asset = asset.upper()
     model, scaler = _load_model_and_scaler(asset)
 
-    # Fetch latest candles from Binance
-    df = _binance_latest_window(asset, lookback_steps=SEQ_LEN)
+    # Fetch latest candles from Gate.io
+    df = _gate_latest_window(asset, lookback_steps=SEQ_LEN)
 
     # Feature engineering must mirror `preprocess.make_supervised`
     df["log_close"] = np.log(df["close"])
@@ -147,7 +151,7 @@ def predict_1h_price(asset: str) -> Tuple[float, float]:
 
     # Take last SEQ_LEN rows as the input window
     x = feat_scaled[-SEQ_LEN:]
-    x = np.expand_dims(x, axis=0)  # (1, seq_len, n_features)
+    x = np.expand_dims(x, axis=0)  # shape: (1, seq_len, n_features)
 
     # Model outputs relative change for 1h ahead
     rel_change = float(model.predict(x, verbose=0)[0, 0])

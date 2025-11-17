@@ -3,12 +3,11 @@
 import os
 
 # ---- Binance spot config ----
-BINANCE_BASE = "https://api.binance.com"
-
-BINANCE_SYMBOLS = {
-    "BTC": "BTCUSDT",
-    "ETH": "ETHUSDT",
-    "TAO": "TAOUSDT",  # adjust if needed
+GATE_BASE = "https://api.gateio.ws/api/v4"
+ASSETS = {
+    "BTC": {"symbol": "BTC_USDT"},
+    "ETH": {"symbol": "ETH_USDT"},
+    "TAO": {"symbol": "TAO_USDT"},  # adjust if TAO symbol differs
 }
 
 # Candle interval
