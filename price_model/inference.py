@@ -51,7 +51,7 @@ def _load_model_and_scaler(asset: str):
         raise RuntimeError(f"Scaler not found for {asset}: {scaler_path}")
 
     scaler = joblib.load(scaler_path)
-    model = tf.keras.models.load_model(model_path)
+    model = tf.keras.models.load_model(model_path, compile=False)
 
     _model_cache[asset] = model
     _scaler_cache[asset] = scaler
