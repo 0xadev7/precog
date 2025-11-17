@@ -59,14 +59,6 @@ def _load_model_and_scaler(asset: str):
 def _gate_latest_window(asset: str, lookback_steps: int = SEQ_LEN) -> pd.DataFrame:
     """
     Fetch the latest `lookback_steps` candles for the asset from Gate.io spot.
-
-    We call /spot/candlesticks with a 'limit' parameter (no 'from' / 'to') to
-    avoid 'too long ago' and 'range too broad' errors. Gate returns rows like:
-
-      [t, v, c, h, l, o, ...]  (most recent first)
-
-    We convert to a DataFrame with columns:
-      timestamp (seconds), open, high, low, close, volume
     """
     asset = asset.lower()
     if asset.upper() not in ASSETS:
@@ -74,8 +66,9 @@ def _gate_latest_window(asset: str, lookback_steps: int = SEQ_LEN) -> pd.DataFra
 
     symbol = ASSETS[asset.upper()]["symbol"]
 
-    # Ask for a bit more than SEQ_LEN as safety margin
-    limit = max(lookback_steps + 10, lookback_steps)
+    # Ask for *significantly* more than SEQ_LEN as safety margin, because
+    # feature engineering (diffs) will drop some rows.
+    limit = max(lookback_steps * 2, lookback_steps + 40, 120)
 
     url = f"{GATE_BASE}/spot/candlesticks"
     params = {
@@ -111,30 +104,20 @@ def _gate_latest_window(asset: str, lookback_steps: int = SEQ_LEN) -> pd.DataFra
             f"Not enough recent candles for {asset}: " f"len(df)={len(df)} < lookback_steps={lookback_steps}"
         )
 
-    # Only keep the last lookback_steps rows
+    # Only keep the last lookback_steps rows (for raw candles)
     df = df.tail(lookback_steps).reset_index(drop=True)
     df["datetime"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
     return df
 
 
 def predict_1h_price(asset: str) -> Tuple[float, float]:
-    """
-    Predict price 1 hour ahead (12 x 5m steps) for the given asset using
-    the trained GRU model.
-
-    Args:
-        asset: 'BTC', 'ETH', or 'TAO' (case-insensitive).
-
-    Returns:
-        (current_price, predicted_price_1h)
-    """
     asset = asset.upper()
     model, scaler = _load_model_and_scaler(asset)
 
     # Fetch latest candles from Gate.io
     df = _gate_latest_window(asset, lookback_steps=SEQ_LEN)
 
-    # Feature engineering must mirror `preprocess.make_supervised`
+    # Feature engineering
     df["log_close"] = np.log(df["close"])
     df["ret_1"] = df["log_close"].diff()
     df["ret_3"] = df["log_close"].diff(3)
@@ -149,11 +132,9 @@ def predict_1h_price(asset: str) -> Tuple[float, float]:
     feat = df[feature_cols].values
     feat_scaled = scaler.transform(feat)
 
-    # Take last SEQ_LEN rows as the input window
     x = feat_scaled[-SEQ_LEN:]
-    x = np.expand_dims(x, axis=0)  # shape: (1, seq_len, n_features)
+    x = np.expand_dims(x, axis=0)
 
-    # Model outputs relative change for 1h ahead
     rel_change = float(model.predict(x, verbose=0)[0, 0])
 
     current_price = float(df["close"].iloc[-1])
