@@ -113,7 +113,11 @@ async def forward_async(synapse: Challenge, cm: CMData) -> Challenge:
             # --- GRU 1h prediction ---
             try:
                 # GRU expects asset symbol; assume upper-case like "BTC"
-                current_price_gru, predicted_price_1h = predict_1h_price(asset.upper())
+                asset_symbol = asset.upper()
+                if asset_symbol == "TAO_BITTENSOR":
+                    asset_symbol = "TAO"
+
+                current_price_gru, predicted_price_1h = predict_1h_price(asset_symbol)
 
                 bt.logging.info(
                     f"{asset}: GRU 1h prediction=${predicted_price_1h:.2f} "
