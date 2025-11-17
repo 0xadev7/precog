@@ -21,9 +21,8 @@ from precog.utils.timestamp import to_datetime, to_str
 # Optional ML & NLP dependencies (graceful fallback if missing)
 # ------------------------------------------------------------
 try:
-    from sklearn.linear_model import RidgeCV
-    from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-    from sklearn.metrics import mean_squared_error
+    # We only need GradientBoostingRegressor now
+    from sklearn.ensemble import GradientBoostingRegressor
 
     SKLEARN_OK = True
 except Exception:
@@ -72,7 +71,8 @@ MAX_OI_MARKETS = int(os.environ.get("MAX_OI_MARKETS", "5"))  # markets per asset
 DERIV_LOOKBACK_DAYS = float(os.environ.get("DERIV_LOOKBACK_DAYS", "3"))
 
 # Social sentiment flags
-ENABLE_SOCIAL_SENTIMENT = os.environ.get("ENABLE_SOCIAL_SENTIMENT", "1") == "1"
+# Disabled by default for speed / reliability. Enable via env if your APIs work.
+ENABLE_SOCIAL_SENTIMENT = os.environ.get("ENABLE_SOCIAL_SENTIMENT", "0") == "1"
 ENABLE_REDDIT_SENTIMENT = os.environ.get("ENABLE_REDDIT_SENTIMENT", "1") == "1"
 ENABLE_STOCKTWITS_SENTIMENT = os.environ.get("ENABLE_STOCKTWITS_SENTIMENT", "1") == "1"
 
@@ -743,13 +743,15 @@ def get_price_history(asset: str, start: pd.Timestamp, end: pd.Timestamp, cm: Op
 
 
 # -----------------------------
-# Core ML model (enhanced)
+# Core ML model (fast GBR-only)
 # -----------------------------
 def _fit_predict_return(X: pd.DataFrame, y: pd.Series) -> float:
     """
     Train a small but strong model and return latest prediction (float log-return).
-    Priority (with validation when history is sufficient):
-        XGBoost / CatBoost / GradientBoosting / RandomForest / RidgeCV / numpy ridge.
+
+    Performance-optimized version:
+      - Single GradientBoostingRegressor (scikit-learn; no XGBoost/CatBoost/RF cascade)
+      - Numpy ridge fallback only for very small samples
     """
     # Basic cleaning
     mask = ~(X.isna().any(axis=1) | y.isna())
@@ -762,8 +764,9 @@ def _fit_predict_return(X: pd.DataFrame, y: pd.Series) -> float:
         bt.logging.debug(f"_fit_predict_return: insufficient samples={n_samples}, returning 0.0")
         return 0.0
 
-    X_all = Xc.values
-    y_all = yc.values
+    # Use float32 to speed up training
+    X_all = Xc.values.astype("float32")
+    y_all = yc.values.astype("float32")
 
     # Last row is the one we want to predict for
     x_last = X_all[-1:].copy()
@@ -774,261 +777,34 @@ def _fit_predict_return(X: pd.DataFrame, y: pd.Series) -> float:
         bt.logging.debug(
             f"_fit_predict_return: train_full too small={len(X_train_full)}, " "falling back to simple ridge"
         )
-        # Fallback to simple numpy ridge on tiny datasets
         lam = 1.0
         XtX = X_train_full.T @ X_train_full
-        XtX_reg = XtX + lam * np.eye(XtX.shape[0])
+        XtX_reg = XtX + lam * np.eye(XtX.shape[0], dtype=X_train_full.dtype)
         w = np.linalg.pinv(XtX_reg) @ X_train_full.T @ y_train_full
         pred = float(x_last @ w)
         return pred
 
-    # ------------------------------------------------------------------
-    # Try to use a small chronological validation slice to choose model
-    # ------------------------------------------------------------------
-    use_validation = SKLEARN_OK and len(X_train_full) >= 200
-    best_model_name = None
-    best_model = None
-    best_mse = float("inf")
-    best_is_numpy = False
+    if not SKLEARN_OK:
+        # Extremely unlikely in your setup, but keep a safe fallback
+        bt.logging.warning("_fit_predict_return: SKLEARN_OK=False, using numpy ridge.")
+        lam = 1.0
+        XtX = X_train_full.T @ X_train_full
+        XtX_reg = XtX + lam * np.eye(XtX.shape[0], dtype=X_train_full.dtype)
+        w = np.linalg.pinv(XtX_reg) @ X_train_full.T @ y_train_full
+        pred = float(x_last @ w)
+        return pred
 
-    if use_validation:
-        n_full = len(X_train_full)
-        split = int(n_full * 0.7)
-        # Require at least a modest validation set
-        if n_full - split < 20:
-            split = max(1, n_full - 20)
+    # Single, moderately sized GradientBoostingRegressor
+    model = GradientBoostingRegressor(
+        n_estimators=150,
+        max_depth=3,
+        learning_rate=0.05,
+        subsample=0.9,
+        random_state=42,
+    )
 
-        X_tr = X_train_full[:split]
-        y_tr = y_train_full[:split]
-        X_val = X_train_full[split:]
-        y_val = y_train_full[split:]
-
-        bt.logging.debug(f"_fit_predict_return: using validation split train={len(X_tr)} val={len(X_val)}")
-
-        # Helper to evaluate sklearn-style models
-        def try_model(name: str, model) -> None:
-            nonlocal best_model_name, best_model, best_mse
-            try:
-                model.fit(X_tr, y_tr)
-                y_hat = model.predict(X_val)
-                mse = float(mean_squared_error(y_val, y_hat))
-                bt.logging.debug(f"_fit_predict_return: {name} validation MSE={mse:.6e}")
-                if mse < best_mse and np.isfinite(mse):
-                    best_mse = mse
-                    best_model_name = name
-                    best_model = model
-            except Exception as e:
-                bt.logging.warning(f"_fit_predict_return: {name} failed -> {e}")
-
-        # XGBoost
-        if XGB_OK:
-            try:
-                xgb_model = XGBRegressor(
-                    n_estimators=400,
-                    max_depth=4,
-                    learning_rate=0.05,
-                    subsample=0.9,
-                    colsample_bytree=0.9,
-                    objective="reg:squarederror",
-                    n_jobs=1,
-                    reg_lambda=1.0,
-                )
-                if len(X_val) >= 30:
-                    xgb_model.fit(
-                        X_tr,
-                        y_tr,
-                        eval_set=[(X_val, y_val)],
-                        verbose=False,
-                    )
-                else:
-                    xgb_model.fit(X_tr, y_tr)
-                y_hat = xgb_model.predict(X_val)
-                mse = float(mean_squared_error(y_val, y_hat))
-                bt.logging.debug(f"_fit_predict_return: XGBRegressor validation MSE={mse:.6e}")
-                if mse < best_mse and np.isfinite(mse):
-                    best_mse = mse
-                    best_model_name = "xgb"
-                    best_model = xgb_model
-            except Exception as e:
-                bt.logging.warning(f"_fit_predict_return: XGBRegressor failed -> {e}")
-
-        # CatBoost
-        if CATBOOST_OK:
-            try:
-                cb_model = CatBoostRegressor(
-                    depth=4,
-                    learning_rate=0.05,
-                    n_estimators=300,
-                    loss_function="RMSE",
-                    verbose=False,
-                )
-                cb_model.fit(X_tr, y_tr, eval_set=(X_val, y_val), verbose=False)
-                y_hat = cb_model.predict(X_val)
-                mse = float(mean_squared_error(y_val, y_hat))
-                bt.logging.debug(f"_fit_predict_return: CatBoostRegressor validation MSE={mse:.6e}")
-                if mse < best_mse and np.isfinite(mse):
-                    best_mse = mse
-                    best_model_name = "catboost"
-                    best_model = cb_model
-            except Exception as e:
-                bt.logging.warning(f"_fit_predict_return: CatBoostRegressor failed -> {e}")
-
-        # Gradient Boosting
-        if SKLEARN_OK:
-            try:
-                gbr_model = GradientBoostingRegressor(
-                    n_estimators=300,
-                    max_depth=3,
-                    learning_rate=0.05,
-                    subsample=0.9,
-                )
-                try_model("GradientBoostingRegressor", gbr_model)
-            except Exception as e:
-                bt.logging.warning(f"_fit_predict_return: GradientBoostingRegressor failed -> {e}")
-
-        # Random Forest
-        if SKLEARN_OK:
-            try:
-                rf_model = RandomForestRegressor(
-                    n_estimators=200,
-                    max_depth=6,
-                    min_samples_leaf=3,
-                    n_jobs=1,
-                )
-                try_model("RandomForestRegressor", rf_model)
-            except Exception as e:
-                bt.logging.warning(f"_fit_predict_return: RandomForestRegressor failed -> {e}")
-
-        # RidgeCV
-        if SKLEARN_OK:
-            try:
-                ridge_model = RidgeCV(alphas=[0.1, 1.0, 10.0, 100.0], store_cv_values=False)
-                try_model("RidgeCV", ridge_model)
-            except Exception as e:
-                bt.logging.warning(f"_fit_predict_return: RidgeCV (val) failed -> {e}")
-
-        # Manual numpy ridge as a candidate as well
-        try:
-            lam = 1.0
-            XtX = X_tr.T @ X_tr
-            XtX_reg = XtX + lam * np.eye(XtX.shape[0])
-            w = np.linalg.pinv(XtX_reg) @ X_tr.T @ y_tr
-            y_hat = X_val @ w
-            mse = float(np.mean((y_val - y_hat) ** 2))
-            bt.logging.debug(f"_fit_predict_return: numpy_ridge validation MSE={mse:.6e}")
-            if mse < best_mse and np.isfinite(mse):
-                best_mse = mse
-                best_model_name = "numpy_ridge"
-                best_model = w  # store weights directly
-                best_is_numpy = True
-        except Exception as e:
-            bt.logging.warning(f"_fit_predict_return: numpy ridge candidate failed -> {e}")
-
-        # If we found a winner, refit on full train and predict
-        if best_model_name is not None:
-            bt.logging.info(f"_fit_predict_return: selected model={best_model_name}")
-            if best_is_numpy:
-                # Refit weights on full training set
-                lam = 1.0
-                XtX = X_train_full.T @ X_train_full
-                XtX_reg = XtX + lam * np.eye(XtX.shape[0])
-                w = np.linalg.pinv(XtX_reg) @ X_train_full.T @ y_train_full
-                pred = float(x_last @ w)
-                return pred
-
-            # Refit the chosen model on all training data (excluding last row)
-            try:
-                best_model.fit(X_train_full, y_train_full)
-                pred = float(best_model.predict(x_last)[0])
-                return pred
-            except Exception as e:
-                bt.logging.warning(f"_fit_predict_return: refit of best model={best_model_name} failed -> {e}")
-
-    # ------------------------------------------------------------------
-    # Fallback: original-style cascade (no explicit validation)
-    # ------------------------------------------------------------------
-    x_train = X_train_full
-    y_train = y_train_full
-
-    # 1) Gradient boosted trees (XGBoost) if available
-    if XGB_OK:
-        try:
-            model = XGBRegressor(
-                n_estimators=300,
-                max_depth=4,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                objective="reg:squarederror",
-                n_jobs=1,
-            )
-            model.fit(x_train, y_train)
-            pred = float(model.predict(x_last)[0])
-            return pred
-        except Exception as e:
-            bt.logging.warning(f"XGBRegressor failed, falling back to other models: {e}")
-
-    # 2) CatBoost if available
-    if CATBOOST_OK:
-        try:
-            cb_model = CatBoostRegressor(
-                depth=4,
-                learning_rate=0.05,
-                n_estimators=300,
-                loss_function="RMSE",
-                verbose=False,
-            )
-            cb_model.fit(x_train, y_train, verbose=False)
-            pred = float(cb_model.predict(x_last)[0])
-            return pred
-        except Exception as e:
-            bt.logging.warning(f"CatBoostRegressor failed, falling back to sklearn: {e}")
-
-    # 3) GradientBoosting / RandomForest / RidgeCV (if sklearn available)
-    if SKLEARN_OK:
-        # Gradient Boosting
-        try:
-            gbr_model = GradientBoostingRegressor(
-                n_estimators=300,
-                max_depth=3,
-                learning_rate=0.05,
-                subsample=0.9,
-            )
-            gbr_model.fit(x_train, y_train)
-            pred = float(gbr_model.predict(x_last)[0])
-            return pred
-        except Exception as e:
-            bt.logging.warning(f"GradientBoostingRegressor failed, trying RandomForest: {e}")
-
-        # RandomForest
-        try:
-            rf_model = RandomForestRegressor(
-                n_estimators=200,
-                max_depth=6,
-                min_samples_leaf=3,
-                n_jobs=1,
-            )
-            rf_model.fit(x_train, y_train)
-            pred = float(rf_model.predict(x_last)[0])
-            return pred
-        except Exception as e:
-            bt.logging.warning(f"RandomForestRegressor failed, trying RidgeCV: {e}")
-
-        # RidgeCV
-        try:
-            model = RidgeCV(alphas=[0.1, 1.0, 10.0, 100.0], store_cv_values=False)
-            model.fit(x_train, y_train)
-            pred = float(model.predict(x_last)[0])
-            return pred
-        except Exception as e:
-            bt.logging.warning(f"RidgeCV failed, falling back to numpy ridge: {e}")
-
-    # 4) Manual ridge via numpy
-    lam = 1.0
-    XtX = x_train.T @ x_train
-    XtX_reg = XtX + lam * np.eye(XtX.shape[0])
-    w = np.linalg.pinv(XtX_reg) @ x_train.T @ y_train
-    pred = float(x_last @ w)
+    model.fit(X_train_full, y_train_full)
+    pred = float(model.predict(x_last)[0])
     return pred
 
 
