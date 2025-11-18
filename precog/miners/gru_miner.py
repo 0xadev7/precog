@@ -20,12 +20,7 @@ def _asset_to_binance_symbol(asset: str) -> str:
     Map internal asset name to Binance symbol (USDT pairs by default).
     """
     a = asset.lower()
-    mapping = {
-        "btc": "BTCUSDT",
-        "eth": "ETHUSDT",
-        "etc": "ETCUSDT",
-        "tao": "TAOUSDT",  # if not listed, fetch will fail and we handle it
-    }
+    mapping = {"btc": "BTCUSDT", "eth": "ETHUSDT", "etc": "ETCUSDT", "tao": "TAOUSDT", "tao_bittensor": "TAOUSDT"}
     return mapping.get(a, f"{asset.upper()}USDT")
 
 
