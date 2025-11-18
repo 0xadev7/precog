@@ -128,12 +128,16 @@ async def forward_async(synapse: Challenge, cm: CMData) -> Challenge:
     start_timestamp = get_before(synapse.timestamp, hours=1, minutes=0, seconds=0)  # 1h window for volatility
 
     # Fetch ALL data in a single CM call (still used for interval + logging)
-    all_data = cm.get_CM_ReferenceRate(
-        assets=assets,
-        start=to_str(start_timestamp),
-        end=to_str(provided_timestamp),
-        frequency="1s",
-    )
+    try:
+        all_data = cm.get_CM_ReferenceRate(
+            assets=assets,
+            start=to_str(start_timestamp),
+            end=to_str(provided_timestamp),
+            frequency="1s",
+        )
+    except Exception as e:
+        bt.logging.error(f"Error getting reference rate from CM: {e}")
+        all_data = pd.DataFrame()
 
     predictions = {}
     intervals = {}
