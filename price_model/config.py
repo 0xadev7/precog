@@ -3,11 +3,12 @@
 import os
 
 # ---- Binance spot config ----
-GATE_BASE = "https://api.gateio.ws/api/v4"
-ASSETS = {
-    "BTC": {"symbol": "BTC_USDT"},
-    "ETH": {"symbol": "ETH_USDT"},
-    "TAO": {"symbol": "TAO_USDT"},  # adjust if TAO symbol differs
+BINANCE_BASE = "https://api.binance.com"
+
+BINANCE_SYMBOLS = {
+    "BTC": "BTCUSDT",
+    "ETH": "ETHUSDT",
+    "TAO": "TAOUSDT",  # adjust if needed
 }
 
 # Candle interval
@@ -24,7 +25,7 @@ INTERVAL_SEC_MAP = {
 INTERVAL_SEC = INTERVAL_SEC_MAP[INTERVAL]
 
 # ---- ML / dataset config ----
-LOOKBACK_DAYS = 90  # history for training
+LOOKBACK_DAYS = 360  # history for training
 SEQ_LEN = 60  # input sequence length (60 * 5m = 5h)
 HORIZON_STEPS = 12  # prediction horizon (12 * 5m = 1h)
 

@@ -3,6 +3,7 @@ from typing import Tuple
 
 import bittensor as bt
 import pandas as pd
+import numpy as np
 
 from precog.protocol import Challenge
 from precog.utils.cm_data import CMData
@@ -15,52 +16,91 @@ from price_model.inference import predict_1h_price
 def calculate_prediction_interval(
     point_estimate: float, historical_prices: pd.Series, asset: str = "btc"
 ) -> Tuple[float, float]:
-    """Calculate prediction interval using historical volatility from provided data.
+    """
+    Calculate a 1-hour prediction interval around the GRU point estimate.
+
+    We use realized 1h volatility from high-frequency CM ReferenceRate data
+    (typically 1-second prices), then translate that into a percentage band.
 
     Args:
-        point_estimate (float): The center of the prediction interval (predicted price).
-        historical_prices (pd.Series): Historical price data for volatility calculation.
-        asset (str): The asset name for logging.
+        point_estimate (float): GRU-predicted 1h-ahead price (or CM fallback).
+        historical_prices (pd.Series): High-frequency price series for the
+            recent window (e.g. last hour from CM).
+        asset (str): Asset name for logging / asset-specific caps.
 
     Returns:
         (float, float): (lower_bound, upper_bound)
     """
     try:
-        if historical_prices.empty or len(historical_prices) < 100:
-            bt.logging.warning(f"Insufficient data for {asset}, using fallback interval")
-            # Fallback: ±10% of point estimate
-            margin = point_estimate * 0.10
+        if historical_prices is None or historical_prices.empty:
+            bt.logging.warning(f"{asset}: No historical data for interval; using fallback ±15%.")
+            margin = point_estimate * 0.15
             return point_estimate - margin, point_estimate + margin
 
-        # Calculate returns (percentage changes)
-        hourly_returns = historical_prices.pct_change().dropna()
-
-        # Remove extreme outliers (beyond 3 std devs) to get realistic volatility
-        returns_std = hourly_returns.std()
-        returns_mean = hourly_returns.mean()
-        outlier_mask = abs(hourly_returns - returns_mean) <= 3 * returns_std
-        clean_returns = hourly_returns[outlier_mask]
-
-        if len(clean_returns) < 12:
-            bt.logging.warning(f"Too few clean data points for {asset}, using fallback")
-            margin = point_estimate * 0.10  # Increased from 5%
+        # Require at least a few minutes of data (e.g. ~5 minutes at 1s frequency).
+        if len(historical_prices) < 300:
+            bt.logging.warning(f"{asset}: Too few points ({len(historical_prices)}) for interval; using fallback ±12%.")
+            margin = point_estimate * 0.12
             return point_estimate - margin, point_estimate + margin
 
-        # Use standard deviation of returns for 1-hour prediction
-        hourly_vol = float(clean_returns.std())
+        # 1) High-frequency returns (percentage changes)
+        returns = historical_prices.pct_change().dropna()
+        if returns.empty:
+            bt.logging.warning(f"{asset}: Returns series empty; using fallback ±12%.")
+            margin = point_estimate * 0.12
+            return point_estimate - margin, point_estimate + margin
 
-        # 2.58 standard deviations ≈ 99% confidence interval
-        margin = point_estimate * hourly_vol * 2.58
+        # 2) Remove extreme outliers (beyond 4 std devs)
+        r_std = returns.std()
+        if r_std <= 0 or np.isnan(r_std):
+            bt.logging.warning(f"{asset}: Non-positive returns std ({r_std}); using fallback ±12%.")
+            margin = point_estimate * 0.12
+            return point_estimate - margin, point_estimate + margin
 
-        # Cap interval width
-        max_margin = point_estimate * 0.30  # ±30%
-        min_margin = point_estimate * 0.02  # ±2%
-        margin = max(min_margin, min(margin, max_margin))
+        r_mean = returns.mean()
+        outlier_mask = (returns - r_mean).abs() <= 4 * r_std
+        clean_returns = returns[outlier_mask]
+
+        if len(clean_returns) < 100:
+            bt.logging.warning(f"{asset}: Too few clean points ({len(clean_returns)}); using fallback ±12%.")
+            margin = point_estimate * 0.12
+            return point_estimate - margin, point_estimate + margin
+
+        # 3) Realized 1-hour volatility:
+        #    sqrt(sum(r_t^2)) over the last hour ≈ std of 1h return.
+        realized_var = float((clean_returns**2).sum())
+        sigma_1h = float(np.sqrt(realized_var))
+
+        if sigma_1h <= 0 or np.isnan(sigma_1h):
+            bt.logging.warning(f"{asset}: Non-positive realized volatility ({sigma_1h}); using fallback ±12%.")
+            margin = point_estimate * 0.12
+            return point_estimate - margin, point_estimate + margin
+
+        # 4) Convert to a confidence band.
+        #    Use ~95% interval: z ≈ 1.96. This is for the 1h return.
+        z = 1.96
+        raw_margin_pct = sigma_1h * z  # in *return* space
+
+        # Asset-aware min / max caps to avoid overly tight/wide bands.
+        asset_lower = asset.lower()
+        if "tao" in asset_lower:
+            # TAO is usually more volatile
+            min_pct, max_pct = 0.03, 0.40  # 3%–40%
+        elif asset_lower in ("btc", "eth", "etc"):
+            min_pct, max_pct = 0.01, 0.25  # 1%–25%
+        else:
+            min_pct, max_pct = 0.015, 0.30  # default 1.5%–30%
+
+        margin_pct = max(min_pct, min(raw_margin_pct, max_pct))
+        margin = point_estimate * margin_pct
 
         lower_bound = point_estimate - margin
         upper_bound = point_estimate + margin
 
-        bt.logging.debug(f"{asset}: hourly_vol={hourly_vol:.4f}, margin=${margin:.2f}")
+        bt.logging.debug(
+            f"{asset}: sigma_1h={sigma_1h:.4f}, raw_margin_pct={raw_margin_pct:.4f}, "
+            f"clamped_margin_pct={margin_pct:.4f}, margin=${margin:.2f}"
+        )
 
         return lower_bound, upper_bound
 

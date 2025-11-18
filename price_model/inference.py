@@ -10,174 +10,215 @@ import joblib
 import tensorflow as tf
 
 from .config import (
-    GATE_BASE,
-    ASSETS,
+    BINANCE_BASE,
+    BINANCE_SYMBOLS,
     INTERVAL,
     SEQ_LEN,
+    HORIZON_STEPS,
     PROCESSED_DIR,
     MODEL_DIR,
+    INTERVAL_SEC,
 )
 
-# Cache for models and scalers so we don't reload on every inference
-_model_cache: Dict[str, tf.keras.Model] = {}
-_scaler_cache: Dict[str, object] = {}
+# ---------------------------------------------------------------------
+# Caches (so repeated calls stay well under your 12s budget)
+# ---------------------------------------------------------------------
+
+_MODEL_CACHE: Dict[str, tf.keras.Model] = {}
+_SCALER_CACHE: Dict[str, object] = {}
 
 
-def _load_model_and_scaler(asset: str):
+def _normalize_asset_key(asset: str) -> str:
     """
-    Load (or reuse cached) GRU model and scaler for the given asset symbol,
-    where asset is 'BTC', 'ETH', or 'TAO'.
+    Map various incoming asset strings to our canonical keys.
     """
-    asset = asset.upper()
-    if asset in _model_cache:
-        return _model_cache[asset], _scaler_cache[asset]
-
-    model_path_best = os.path.join(MODEL_DIR, f"{asset.lower()}_gru_best.h5")
-    model_path_final = os.path.join(MODEL_DIR, f"{asset.lower()}_gru_final.h5")
-
-    if os.path.exists(model_path_best):
-        model_path = model_path_best
-    elif os.path.exists(model_path_final):
-        model_path = model_path_final
-    else:
-        raise RuntimeError(f"Model for {asset} not found. Checked:\n" f"  {model_path_best}\n" f"  {model_path_final}")
-
-    scaler_path = os.path.join(PROCESSED_DIR, f"{asset.lower()}_scaler.pkl")
-    if not os.path.exists(scaler_path):
-        raise RuntimeError(f"Scaler not found for {asset}: {scaler_path}")
-
-    scaler = joblib.load(scaler_path)
-
-    # Avoid deserializing training-time metrics (mse, etc.)
-    model = tf.keras.models.load_model(model_path, compile=False)
-
-    _model_cache[asset] = model
-    _scaler_cache[asset] = scaler
-    return model, scaler
+    a = asset.upper()
+    # Handle TAO_BITTENSOR etc.
+    if a in ("TAO_BITTENSOR", "TAO-BITTENSOR"):
+        return "TAO"
+    return a
 
 
-def _gate_latest_window(asset: str, min_rows: int = SEQ_LEN + 20) -> pd.DataFrame:
-    """
-    Fetch the latest candles for the asset from Gate.io spot.
+def _load_model_and_scaler(asset: str) -> Tuple[tf.keras.Model, object]:
+    key = _normalize_asset_key(asset)
+    if key not in _MODEL_CACHE:
+        model_path = os.path.join(MODEL_DIR, f"{key.lower()}_gru_final.h5")
+        scaler_path = os.path.join(PROCESSED_DIR, f"{key.lower()}_scaler.pkl")
 
-    We request significantly more than SEQ_LEN candles so that after
-    feature engineering and dropna() we still have >= SEQ_LEN rows.
-    """
-    asset_lower = asset.lower()
-    asset_upper = asset.upper()
-    if asset_upper not in ASSETS:
-        raise ValueError(f"Unknown asset for Gate.io: {asset}")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Missing model for {key}: {model_path}")
+        if not os.path.exists(scaler_path):
+            raise FileNotFoundError(f"Missing scaler for {key}: {scaler_path}")
 
-    symbol = ASSETS[asset_upper]["symbol"]
+        model = tf.keras.models.load_model(model_path)
+        scaler = joblib.load(scaler_path)
 
-    # Ask for plenty of candles to survive diff() and dropna()
-    limit = max(min_rows * 2, SEQ_LEN * 3, 180)
+        _MODEL_CACHE[key] = model
+        _SCALER_CACHE[key] = scaler
 
-    url = f"{GATE_BASE}/spot/candlesticks"
-    params = {
-        "currency_pair": symbol,
-        "interval": INTERVAL,
-        "limit": limit,
-    }
+    return _MODEL_CACHE[key], _SCALER_CACHE[key]
 
-    r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    data = r.json()
 
-    if not data:
-        raise RuntimeError(f"No candlestick data from Gate.io for {asset} ({symbol})")
+# ---------------------------------------------------------------------
+# Binance fetch & feature engineering
+# ---------------------------------------------------------------------
 
-    rows = []
-    # Gate returns newest first; we'll sort ascending by timestamp
-    for row in data:
-        # row schema: [t, v, c, h, l, o, ...]
-        ts = int(row[0])
-        vol = float(row[1])
-        close = float(row[2])
-        high = float(row[3])
-        low = float(row[4])
-        open_ = float(row[5])
-        rows.append((ts, open_, high, low, close, vol))
+# Must match FEATURE_COLS in preprocess.py
+FEATURE_COLS = [
+    "log_close",
+    "ret_1",
+    "ret_3",
+    "ret_6",
+    "vol_log",
+    "hl_spread",
+    "oc_change",
+    "rolling_vol_1h",
+    "rolling_ret_1h",
+    "rolling_vol_4h",
+    "rolling_ret_4h",
+    "ma_ratio",
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos",
+]
 
-    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df = df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
 
-    if len(df) < SEQ_LEN:
-        raise RuntimeError(f"Not enough recent candles for {asset}: len(df)={len(df)} < SEQ_LEN={SEQ_LEN}")
+def _fetch_latest_klines(asset: str, limit: int = 500) -> pd.DataFrame:
+    key = _normalize_asset_key(asset)
+    if key not in BINANCE_SYMBOLS:
+        raise ValueError(f"Unknown asset for Binance: {asset}")
 
-    # Do NOT cut to SEQ_LEN here; we keep more and trim after feature engineering
-    df["datetime"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+    symbol = BINANCE_SYMBOLS[key]
+    url = f"{BINANCE_BASE}/api/v3/klines"
+    params = {"symbol": symbol, "interval": INTERVAL, "limit": limit}
+
+    resp = requests.get(url, params=params, timeout=10)
+    resp.raise_for_status()
+    rows = resp.json()
+    if not rows:
+        raise RuntimeError(f"No kline data from Binance for {symbol}")
+
+    cols = [
+        "open_time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "close_time",
+        "quote_asset_volume",
+        "number_of_trades",
+        "taker_buy_base_asset_volume",
+        "taker_buy_quote_asset_volume",
+        "ignore",
+    ]
+    df = pd.DataFrame(rows, columns=cols)
+
+    numeric_cols = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "quote_asset_volume",
+        "number_of_trades",
+        "taker_buy_base_asset_volume",
+        "taker_buy_quote_asset_volume",
+    ]
+    for c in numeric_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df["timestamp_ms"] = df["open_time"].astype("int64")
+    df["timestamp"] = (df["timestamp_ms"] // 1000).astype("int64")
+    df["datetime"] = pd.to_datetime(df["timestamp_ms"], unit="ms", utc=True)
+
+    df = df.sort_values("timestamp").reset_index(drop=True)
     return df
 
 
-def _build_feature_window(df: pd.DataFrame, asset: str) -> Tuple[np.ndarray, float]:
-    """
-    Apply feature engineering mirroring training, and produce the
-    last SEQ_LEN feature rows.
+def _build_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy().sort_values("timestamp").reset_index(drop=True)
 
-    If we end up with slightly fewer than SEQ_LEN rows, pad the
-    sequence at the front with the earliest row to reach SEQ_LEN.
-    """
-    # Feature engineering must mirror preprocess.make_supervised
-    df = df.copy()
-    df["log_close"] = np.log(df["close"])
-    df["ret_1"] = df["log_close"].diff()
+    df["log_close"] = np.log(df["close"].astype(float))
+    df["ret_1"] = df["log_close"].diff(1)
     df["ret_3"] = df["log_close"].diff(3)
     df["ret_6"] = df["log_close"].diff(6)
-    df["vol_log"] = np.log1p(df["volume"])
-    df = df.dropna().reset_index(drop=True)
 
-    if len(df) == 0:
-        raise RuntimeError(f"No rows left after feature engineering for {asset}")
+    df["vol_log"] = np.log(df["volume"].astype(float) + 1e-8)
+    df["hl_spread"] = (df["high"] - df["low"]) / df["close"].replace(0, np.nan)
+    df["oc_change"] = (df["close"] - df["open"]) / df["open"].replace(0, np.nan)
 
-    # Use the last SEQ_LEN rows if possible; otherwise pad
-    if len(df) >= SEQ_LEN:
-        df_win = df.tail(SEQ_LEN).reset_index(drop=True)
-    else:
-        # Pad at the front with the earliest row to reach SEQ_LEN
-        missing = SEQ_LEN - len(df)
-        first_row = df.iloc[0:1].copy()
-        pad_df = pd.concat([first_row] * missing, ignore_index=True)
-        df_win = pd.concat([pad_df, df], ignore_index=True)
+    df["rolling_vol_1h"] = df["log_close"].rolling(12).std()
+    df["rolling_ret_1h"] = df["log_close"].diff(12)
+    df["rolling_vol_4h"] = df["log_close"].rolling(48).std()
+    df["rolling_ret_4h"] = df["log_close"].diff(48)
 
-    # Current price is the last close in the (possibly padded) window
+    df["ma_fast"] = df["close"].rolling(12).mean()
+    df["ma_slow"] = df["close"].rolling(36).mean()
+    df["ma_ratio"] = df["ma_fast"] / df["ma_slow"].replace(0, np.nan) - 1.0
+
+    dt = pd.to_datetime(df["datetime"], utc=True)
+    df["hour"] = dt.dt.hour
+    df["dow"] = dt.dt.dayofweek
+
+    df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24.0)
+    df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24.0)
+    df["dow_sin"] = np.sin(2 * np.pi * df["dow"] / 7.0)
+    df["dow_cos"] = np.cos(2 * np.pi * df["dow"] / 7.0)
+
+    return df
+
+
+def _build_feature_window(df_raw: pd.DataFrame, asset: str) -> Tuple[np.ndarray, float]:
+    """
+    Build the last SEQ_LEN feature window and return (features, current_price).
+
+    features shape: (SEQ_LEN, n_features)
+    """
+    df = _build_features(df_raw)
+
+    # Drop rows with NaNs in any feature or in close
+    df = df.dropna(subset=FEATURE_COLS + ["close"]).reset_index(drop=True)
+    if len(df) < SEQ_LEN:
+        raise RuntimeError(f"Not enough rows after feature engineering for {asset}: " f"{len(df)} < SEQ_LEN={SEQ_LEN}")
+
+    # Latest window
+    df_win = df.iloc[-SEQ_LEN:]
+    feat = df_win[FEATURE_COLS].to_numpy(dtype=np.float32)
+
     current_price = float(df_win["close"].iloc[-1])
-
-    feature_cols = ["log_close", "ret_1", "ret_3", "ret_6", "vol_log"]
-    feat = df_win[feature_cols].values.astype(np.float32)
 
     return feat, current_price
 
 
+# ---------------------------------------------------------------------
+# Public API: used by gru_miner.predict_1h_price
+# ---------------------------------------------------------------------
+
+
 def predict_1h_price(asset: str) -> Tuple[float, float]:
     """
-    Predict price 1 hour ahead (12 x 5m steps) for the given asset using
-    the trained GRU model.
-
-    Args:
-        asset: 'BTC', 'ETH', or 'TAO' (case-insensitive).
+    Predict 1h-ahead price for `asset` using Binance public data
+    and the trained GRU model.
 
     Returns:
         (current_price, predicted_price_1h)
     """
-    asset = asset.upper()
-    model, scaler = _load_model_and_scaler(asset)
+    asset_key = _normalize_asset_key(asset)
+    model, scaler = _load_model_and_scaler(asset_key)
 
-    # Fetch latest candles from Gate.io
-    df_raw = _gate_latest_window(asset, min_rows=SEQ_LEN + 20)
+    # Fetch recent history; limit big enough to cover SEQ_LEN + roll windows
+    df_raw = _fetch_latest_klines(asset_key, limit=max(SEQ_LEN + 60, 200))
 
-    # Build feature window and get current price
-    feat, current_price = _build_feature_window(df_raw, asset)
-
-    # Scale features with training scaler
+    feat, current_price = _build_feature_window(df_raw, asset_key)
     feat_scaled = scaler.transform(feat)
 
-    # Shape (1, seq_len, n_features)
+    # Shape (1, SEQ_LEN, n_features)
     x = np.expand_dims(feat_scaled, axis=0)
 
-    # Model outputs relative change for 1h ahead
+    # Model outputs relative change (future/current - 1)
     rel_change = float(model.predict(x, verbose=0)[0, 0])
-
     predicted_price = current_price * (1.0 + rel_change)
 
     return current_price, predicted_price
